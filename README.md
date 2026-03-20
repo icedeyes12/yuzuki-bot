@@ -14,18 +14,16 @@ A sentient AI companion for Discord with persistent memory and emotional depth.
 ### 1. Clone & Install
 
 ```bash
-git clone <your-repo>
-cd yuzuki-bot
+git clone https://github.com/icedeyes12/yuzuki
+cd yuzuki
 pip install -r requirements.txt
 ```
 
 ### 2. Environment Setup
 
-Copy `.env.example` to `.env` and fill in your values:
-
 ```bash
 cp .env.example .env
-# Edit .env with your actual credentials
+# Edit .env with your actual credentials (see table below)
 ```
 
 ### 3. Database Setup
@@ -34,7 +32,7 @@ cp .env.example .env
 # Start PostgreSQL
 service postgresql start
 
-# Create database
+# Create DB, user, and tables
 python3 scripts/setup_db.py
 ```
 
@@ -50,6 +48,7 @@ python3 dcbot.py
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `DISCORD_TOKEN` | ✅ | Discord bot token |
+| `DISCORD_ID` | ❌ | Bot application ID (needed for slash commands) |
 | `OWNER_ID` | ✅ | Your Discord user ID |
 | `OWNER_USERNAME` | ✅ | Your identifier (e.g., "Bani") |
 | `CHUTES_API_KEY` | ✅ | Chutes API key |
@@ -58,6 +57,8 @@ python3 dcbot.py
 | `DB_NAME` | ❌ | Database name (default: yuzuki) |
 | `DB_USER` | ❌ | DB username (default: yuzuki) |
 | `DB_PASS` | ✅ | DB password |
+| `LOG_FILE` | ❌ | Log file path (default: /tmp/yuzuki.log) |
+| `MAX_HISTORY` | ❌ | Max history messages sent to LLM (default: 30) |
 
 ## Security Notice
 
@@ -66,16 +67,31 @@ python3 dcbot.py
 ## Project Structure
 
 ```
-yuzuki-bot/
+yuzuki/
 ├── discord/           # Discord bot code
-│   └── dcbot.py      # Main bot
+│   └── dcbot.py      # Main bot entrypoint
 ├── shared/           # Shared modules
-│   ├── config.py     # Configuration
-│   ├── database.py   # Database layer
-│   └── llm_client.py # LLM integration
+│   ├── __init__.py   # Package exports: Config, LLMClient, db
+│   ├── config.py     # Configuration (all env vars)
+│   ├── database.py   # PostgreSQL via asyncpg
+│   └── llm_client.py # Chutes API client (with retry/timeout)
 ├── scripts/          # Setup scripts
-│   └── setup_db.py   # Database initialization
+│   └── setup_db.py   # DB + user + tables creation
 ├── .env.example      # Environment template
 ├── .gitignore        # Git ignore rules
-└── README.md         # This file
+└── README.md
 ```
+
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `!help` | Show help |
+| `!block <user_id>` | Block a user (owner only) |
+| `!unblock <user_id>` | Unblock a user (owner only) |
+
+## Owner Commands
+
+- Mention Yuzuki in any channel
+- DM Yuzuki directly for private conversations
+- Use `!block` / `!unblock` to manage blocked users

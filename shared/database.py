@@ -181,18 +181,31 @@ class YuzukiDatabase:
             ]
     
     async def is_user_blocked(self, user_id: int) -> bool:
+        """Check if user is blocked. New users are not blocked by default."""
         async with self.pool.acquire() as conn:
+            # Check users table
             row = await conn.fetchrow("""
                 SELECT is_blocked FROM users WHERE user_id = $1
             """, user_id)
-            return row["is_blocked"] if row else False
+            if row and row["is_blocked"]:
+                return True
+
+            # Also check blocked_users table for complete picture
+            row2 = await conn.fetchrow("""
+                SELECT 1 FROM blocked_users
+                WHERE user_id = $1 AND is_active = TRUE
+            """, user_id)
+            return row2 is not None
     
     async def block_user(self, user_id: int, blocked_by: int, reason: str = ""):
         async with self.pool.acquire() as conn:
+            # Upsert users table (handles users not yet seen)
             await conn.execute("""
-                UPDATE users SET is_blocked = TRUE, blocked_at = NOW(), 
-                    blocked_by = $2, block_reason = $3
-                WHERE user_id = $1
+                INSERT INTO users (user_id, is_blocked, blocked_at, blocked_by, block_reason)
+                VALUES ($1, TRUE, NOW(), $2, $3)
+                ON CONFLICT (user_id)
+                DO UPDATE SET is_blocked = TRUE, blocked_at = NOW(),
+                              blocked_by = $2, block_reason = $3
             """, user_id, blocked_by, reason)
             
             await conn.execute("""

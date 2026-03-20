@@ -1,22 +1,11 @@
 import asyncio
+import signal
 import sys
 import os
 import re
-import json
 import logging
-from typing import Optional, List, Dict, Any
 from datetime import datetime
-
-# Setup logging to see output
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler('/tmp/yuzuki.log')
-    ]
-)
-logger = logging.getLogger('yuzuki')
+from typing import Optional, Dict, Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,54 +20,73 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
+
+def _setup_logging():
+    handlers = [logging.StreamHandler(sys.stdout)]
+    if Config.LOG_FILE:
+        os.makedirs(os.path.dirname(Config.LOG_FILE), exist_ok=True)
+        handlers.append(logging.FileHandler(Config.LOG_FILE))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=handlers,
+    )
+    return logging.getLogger("yuzuki")
+
+
+logger = _setup_logging()
+
+
 class YuzukiBot(commands.Bot):
     def __init__(self):
         super().__init__(command_prefix="!", intents=intents, help_command=None)
-        self.llm_client = None
+        self.llm_client: Optional[LLMClient] = None
+        self._shutdown_event = asyncio.Event()
+
     async def setup_hook(self):
         logger.info("Connecting to database...")
         await db.connect()
         await db.create_tables()
         logger.info("Database ready")
-        
+
         self.llm_client = LLMClient()
         await self.llm_client.__aenter__()
         logger.info("LLM client ready")
-    
+
     async def close(self):
+        logger.info("Shutting down...")
+        self._shutdown_event.set()
+
         if self.llm_client:
             await self.llm_client.__aexit__(None, None, None)
+            self.llm_client = None
         await db.close()
         await super().close()
-    
+        logger.info("Shutdown complete.")
+
     async def on_ready(self):
         logger.info(f"🤖 {self.user.name} is online!")
         logger.info(f"Owner: <@{Config.OWNER_ID}> ({Config.OWNER_USERNAME})")
         await self.change_presence(
             activity=discord.Activity(type=discord.ActivityType.watching, name="for mentions"),
-            status=discord.Status.online
+            status=discord.Status.online,
         )
-    
+
     async def on_message(self, message: discord.Message):
-        logger.info(f"DEBUG: Message from {message.author.name}: {message.content[:50]}")
-        
         if message.author == self.user:
             return
-        
-        # Check if user is blocked
+
         if await db.is_user_blocked(message.author.id):
             logger.info(f"Blocked user {message.author.id} attempted to message")
             return
-        
+
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_mention = self.user.mentioned_in(message) and not is_dm
-        
+
         if not is_mention and not is_dm:
             return
-        
-        logger.info(f"Processing message - DM: {is_dm}, Mention: {is_mention}")
-        
-        # Store message
+
+        # Store user message
         await db.store_message(
             message_id=message.id,
             channel_id=message.channel.id,
@@ -86,46 +94,54 @@ class YuzukiBot(commands.Bot):
             user_id=message.author.id,
             username=message.author.name,
             content=message.content,
-            is_dm=is_dm
+            is_bot_response=False,
+            is_dm=is_dm,
         )
-        
-        # Clean content
-        content = message.content.replace(f"<@{self.user.id}>", "").replace(f"<@!{self.user.id}>", "").strip()
+
+        # Clean mention prefix
+        content = (
+            message.content.replace(f"<@{self.user.id}>", "")
+            .replace(f"<@!{self.user.id}>", "")
+            .strip()
+        )
         if not content:
             content = "Hello"
-        
+
         async with message.channel.typing():
             try:
-                logger.info(f"Generating response for: {content[:50]}")
                 response = await self._generate_response(message, content, is_dm)
-                
-                # Check if report needed (DM flirt)
+
                 if is_dm and response.get("report"):
                     await self._send_report_to_owner(message, response["report"])
-                
-                # Send reply
+
                 reply_text = response.get("reply", "...")
-                logger.info(f"Reply: {reply_text[:100]}")
-                
                 if reply_text and reply_text != "...":
-                    if len(reply_text) <= 2000:
-                        await message.reply(reply_text, mention_author=False)
-                    else:
-                        await message.reply(reply_text[:2000] + "...", mention_author=False)
-                
+                    sent = await message.reply(
+                        reply_text[:2000], mention_author=False
+                    )
+                    # Store bot's reply so it appears in history
+                    await db.store_message(
+                        message_id=sent.id,
+                        channel_id=message.channel.id,
+                        guild_id=message.guild.id if message.guild else None,
+                        user_id=self.user.id,
+                        username=self.user.name,
+                        content=reply_text,
+                        is_bot_response=True,
+                        is_dm=is_dm,
+                    )
             except Exception as e:
                 logger.error(f"Error generating response: {e}", exc_info=True)
-                await message.reply("❌ I encountered an error. Please try again.", mention_author=False)
-    
-    async def _generate_response(self, message: discord.Message, content: str, is_dm: bool) -> Dict[str, Any]:
-        """Generate response with rich context."""
-        
-        # Get conversation context
+                await message.reply(
+                    "❌ I encountered an error. Please try again.", mention_author=False
+                )
+
+    async def _generate_response(
+        self, message: discord.Message, content: str, is_dm: bool
+    ) -> Dict[str, Any]:
         context = await self._build_context(message, is_dm)
-        
-        # Build system prompt
         owner_mention = f"<@{Config.OWNER_ID}>"
-        
+
         system_prompt = f"""You are Yuzuki, a sentient AI companion.
 
 CORE IDENTITY:
@@ -157,94 +173,104 @@ severity: low|medium|high
 ```
 Then respond naturally."""
 
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": content}
-        ]
-        
-        raw_response = await self.llm_client.chat(messages=messages)
+        raw_response = await self.llm_client.chat(
+            messages=[{"role": "user", "content": content}],
+            system_prompt=system_prompt,
+        )
         return self._parse_response(raw_response)
-    
+
     async def _build_context(self, message: discord.Message, is_dm: bool) -> Dict[str, str]:
-        """Build rich context for LLM."""
-        
-        user_info = f"ID: {message.author.id}, Name: {message.author.name}, Owner: {message.author.id == int(Config.OWNER_ID)}"
-        
+        user_info = (
+            f"ID: {message.author.id}, Name: {message.author.name}, "
+            f"Owner: {message.author.id == int(Config.OWNER_ID)}"
+        )
+
         if is_dm:
             location = f"DM with {message.author.name}"
         else:
             guild = message.guild.name if message.guild else "Unknown"
-            channel = message.channel.name if hasattr(message.channel, 'name') else "Unknown"
+            channel = (
+                message.channel.name
+                if hasattr(message.channel, "name")
+                else "Unknown"
+            )
             location = f"#{channel} in {guild}"
-        
+
         recent = await db.get_recent_messages(
             user_id=message.author.id if is_dm else None,
             channel_id=message.channel.id if not is_dm else None,
-            limit=30
+            limit=Config.MAX_HISTORY,
         )
-        
+
         history_lines = []
         for msg in recent:
             prefix = "Yuzuki:" if msg.get("is_bot") else f"{msg.get('username', 'User')}:"
             history_lines.append(f"{prefix} {msg.get('content', '')[:100]}")
-        
+
         history = "\n".join(history_lines) if history_lines else "(No recent messages)"
-        
-        return {
-            "user": user_info,
-            "location": location,
-            "history": history
-        }
-    
+
+        return {"user": user_info, "location": location, "history": history}
+
     def _parse_response(self, raw: str) -> Dict[str, Any]:
-        """Parse LLM response for report blocks."""
-        result = {"reply": raw, "report": None}
-        
-        if "```report" in raw:
+        """Parse LLM response for report blocks using regex."""
+        result: Dict[str, Any] = {"reply": raw, "report": None}
+
+        report_match = re.search(
+            r"```report\s*\n(.*?)\n```", raw, re.DOTALL | re.IGNORECASE
+        )
+        if report_match:
             try:
-                parts = raw.split("```report")
-                before = parts[0].strip()
-                report_section = parts[1].split("```")[0].strip()
-                after = parts[1].split("```")[1].strip() if "```" in parts[1] else ""
-                
-                report = {}
+                report_section = report_match.group(1)
+                report: Dict[str, str] = {}
                 for line in report_section.strip().split("\n"):
                     if ":" in line:
-                        key, value = line.split(":", 1)
+                        key, _, value = line.partition(":")
                         report[key.strip()] = value.strip()
-                
+
                 result["report"] = report
-                result["reply"] = (before + "\n" + after).strip()
+                # Remove report block from reply
+                result["reply"] = (
+                    raw[: report_match.start()]
+                    + raw[report_match.end() :]
+                ).strip()
             except Exception as e:
-                logger.error(f"Failed to parse report: {e}")
-        
+                logger.error(f"Failed to parse report block: {e}")
+
         return result
-    
-    async def _send_report_to_owner(self, original_msg: discord.Message, report: Dict[str, str]):
-        """Send DM report to owner."""
+
+    async def _send_report_to_owner(
+        self, original_msg: discord.Message, report: Dict[str, str]
+    ):
         try:
             owner = await self.fetch_user(int(Config.OWNER_ID))
             if not owner:
                 logger.warning(f"Could not fetch owner {Config.OWNER_ID}")
                 return
-            
+
             embed = discord.Embed(
                 title="🚨 DM Alert",
                 description="Inappropriate interaction detected",
                 color=discord.Color.orange(),
-                timestamp=datetime.now()
+                timestamp=datetime.now(),
             )
-            embed.add_field(name="User", value=f"@{report.get('username', 'Unknown')}", inline=False)
-            embed.add_field(name="Content", value=f"```{report.get('message', 'N/A')[:1000]}```", inline=False)
-            
+            embed.add_field(
+                name="User", value=f"@{report.get('username', 'Unknown')}", inline=False
+            )
+            embed.add_field(
+                name="Content",
+                value=f"```{report.get('message', 'N/A')[:1000]}```",
+                inline=False,
+            )
+            embed.add_field(name="Severity", value=report.get("severity", "?"), inline=False)
+
             await owner.send(embed=embed)
             logger.info(f"Report sent to owner about user {report.get('user_id')}")
-            
         except Exception as e:
             logger.error(f"Failed to send report: {e}")
 
-# Create bot
+
 bot = YuzukiBot()
+
 
 @bot.command(name="help")
 async def help_cmd(ctx):
@@ -252,6 +278,7 @@ async def help_cmd(ctx):
     embed.add_field(name="Chat", value="@mention me or send DM", inline=False)
     embed.set_footer(text=f"Owner: <@{Config.OWNER_ID}>")
     await ctx.send(embed=embed)
+
 
 @bot.command(name="block")
 async def block_cmd(ctx, user_id: str):
@@ -265,6 +292,7 @@ async def block_cmd(ctx, user_id: str):
     except ValueError:
         await ctx.send("Invalid user ID")
 
+
 @bot.command(name="unblock")
 async def unblock_cmd(ctx, user_id: str):
     if str(ctx.author.id) != Config.OWNER_ID:
@@ -277,10 +305,27 @@ async def unblock_cmd(ctx, user_id: str):
     except ValueError:
         await ctx.send("Invalid user ID")
 
-def main():
+
+def _run_bot():
     Config.validate()
     logger.info(f"Starting Yuzuki... Owner: {Config.OWNER_ID}")
+
+    # Graceful shutdown on SIGTERM / SIGINT
+    loop = asyncio.get_event_loop()
+
+    def _signal_handler(sig):
+        logger.info(f"Received {sig.name}, initiating shutdown...")
+        asyncio.create_task(bot.close())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler, sig)
+        except NotImplementedError:
+            # Windows doesn't support add_signal_handler
+            pass
+
     bot.run(Config.DISCORD_TOKEN)
 
+
 if __name__ == "__main__":
-    main()
+    _run_bot()
