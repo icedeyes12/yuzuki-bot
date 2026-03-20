@@ -14,5 +14,5 @@ Planned integration for Telegram messaging platform.
 ## Usage (planned)
 ```bash
 cd telegram
-python3 bot.py
+python3 telebot.py
 ```
